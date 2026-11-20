@@ -151,6 +151,49 @@ ai.save("custom", "m", "http://127.0.0.1:3001/v1", None, slow=False)
 ai.call("m", "hi", brain.SCHEMA)
 check("a custom service is not sent JSON mode at all", tries == [[]], str(tries))
 
+# ---- a tired free service: the owner's retry rules and the slow mode's rest work together
+from unittest.mock import patch  # noqa: E402
+
+napped = []
+real_time = brain.time
+brain.time = types.SimpleNamespace(sleep=napped.append, time=time.time)
+tired = [ai.AIError("HTTP 429 slow down"), ([{"hook": "h"}], 4, 2)]
+
+
+def tired_call(model, prompt, schema, timeout=None):
+    a = tired.pop(0)
+    if isinstance(a, Exception):
+        raise a
+    return a
+
+
+ai.save("custom", "m", "http://127.0.0.1:3001/v1", None, slow=True, wait=45)
+with patch.object(ai, "call", side_effect=tired_call), patch.object(ai, "wait_turn"):
+    out, _m, _n = brain.ask_ai("p", paced=True)
+check("slow mode waits the whole rest after a 'too many requests', not just the 20 seconds", (out, len(napped), sum(napped)) == ([{"hook": "h"}], 45, 45), str((len(napped), sum(napped))))
+
+napped.clear()
+tired[:] = [ai.AIError("HTTP 429 slow down"), ([{"hook": "h"}], 4, 2)]
+with patch.object(ai, "call", side_effect=tired_call), patch.object(ai, "wait_turn"):
+    looks = [0]
+
+    def cancelled_after_the_first_look():
+        looks[0] += 1
+        return looks[0] > 1                # fine before the request, cancelled while resting after it
+    try:
+        brain.ask_ai("p", paced=True, stop=cancelled_after_the_first_look)
+    except RuntimeError:
+        pass
+check("a video cancelled during the rest stops waiting at once", len(napped) == 0, str(len(napped)))
+
+napped.clear()
+tired[:] = [ai.AIError("HTTP 429 slow down"), ([{"hook": "h"}], 4, 2)]
+ai.save("custom", "m", "http://127.0.0.1:3001/v1", None, slow=False, wait=45)
+with patch.object(ai, "call", side_effect=tired_call):
+    brain.ask_ai("p")
+check("with slow mode off the owner's own wait is used", napped == [20.0], str(napped))
+brain.time = real_time
+
 print("ALL PASSED" if not fails else f"{len(fails)} failed")
 import shutil  # noqa: E402
 

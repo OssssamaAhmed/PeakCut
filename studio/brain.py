@@ -180,8 +180,32 @@ def loud_zscore(db):
     return (db - np.median(db)) / (db.std() + 1e-6)
 
 
+TRIES = 3
+RATE_WAIT = (20, 40)      # seconds to wait after "too many requests", when the service doesn't say how long
+BUSY_WAIT = (5, 10)       # and after the service says it is overloaded (HTTP 5xx)
+MAX_WAIT = 60             # never wait longer than this for one retry
+LIVE_MAX_WAIT = 15        # a live check has a short budget of its own
+
+
+def retry_wait(e, attempt, timeout=None):
+    """How long to wait before asking the same model again, or None when asking again won't help.
+
+    Free keys are limited per minute, so a few seconds is not enough: the wait the service asks for is used
+    when it gives one, and 20 then 40 seconds otherwise. A limit for the whole day is not waited out; the next
+    model (if there is one) is tried instead. Nothing is waited after the last try."""
+    text = str(e)
+    rate = "HTTP 429" in text
+    if not (rate or "HTTP 5" in text) or attempt >= TRIES - 1:
+        return None
+    if rate and (getattr(e, "daily", False) or re.search(r"per ?day|daily", text, re.I)):
+        return None
+    asked = getattr(e, "wait", None)
+    wait = asked if asked is not None else (RATE_WAIT if rate else BUSY_WAIT)[min(attempt, 1)]
+    return min(float(wait), LIVE_MAX_WAIT if timeout else MAX_WAIT)
+
+
 def ask_ai(prompt, schema=None, purpose="AI call", timeout=None, paced=False, stop=None, on_wait=None):
-    """Try each model in order, with a couple of retries for rate limits and overloads.
+    """Try each model in order, with retries for rate limits and overloads (see retry_wait).
     Returns (the answer, the model that gave it, tokens used) and notes the tokens in the usage record.
 
     `paced` is for work that is not waiting on anyone: with "go slowly" on (Settings, AI) it first rests until the
@@ -194,7 +218,7 @@ def ask_ai(prompt, schema=None, purpose="AI call", timeout=None, paced=False, st
             raise RuntimeError("Stopped.")
     last = None
     for model in ai.use_models():
-        for attempt in range(3):
+        for attempt in range(TRIES):
             try:
                 out, sent, wrote = ai.call(model, prompt, schema or SCHEMA, timeout)
                 ai.note_call()
@@ -204,14 +228,17 @@ def ask_ai(prompt, schema=None, purpose="AI call", timeout=None, paced=False, st
             except Exception as e:  # noqa: BLE001
                 last = e
                 ai.note_call()
-                if "HTTP 429" in str(e) or "HTTP 5" in str(e):
-                    # a tired free service is given the whole pause to recover, not a few seconds
-                    for _ in range(max(4 * (attempt + 1), ai.pace_seconds()) if paced else 4 * (attempt + 1)):
+                wait = retry_wait(e, attempt, timeout)
+                if wait is None:
+                    break
+                if paced:
+                    # a tired free service is given the whole rest to recover, and a cancelled video stops waiting
+                    for _ in range(int(max(wait, ai.pace_seconds()))):
                         if stop and stop():
                             break
                         time.sleep(1)
-                    continue
-                break
+                else:
+                    time.sleep(wait)
     ai.note_problem(last)
     raise RuntimeError(f"The AI did not answer: {ai.explain(last) or last}")
 
